@@ -2,8 +2,8 @@
 
 Name: **Necropolis** (official)
 Owner: Anas Ghareib
-Status: Planning → Phase 0
-Last updated: 2026-10-16
+Status: Planning → Phase 0 (blueprint ready to scaffold)
+Last updated: 2026-10-16 (Revision 3; see §16. Precedence: §16 > §15 > earlier sections)
 
 ---
 
@@ -128,7 +128,10 @@ source_commit: 9f3c2ab
 
 **L2 pointer:** `path:startLine-endLine@commit`. Agents read the exact range from disk or git, never from the DB.
 
-### 5.2 Postgres schema (initial)
+### 5.2 Postgres schema (initial, superseded)
+
+> [!WARNING]
+> **Superseded by §15.4.** This is kept to show how the design evolved. Do not scaffold from it: it has nullable foreign keys, no FK on `edge.dst_file`, commit-based caching, and no `root`, `card`, `embedding_model` or `audit_log` tables. The authoritative `migrations/00001_init.sql` is in §15.4.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -389,13 +392,16 @@ Re-run the eval on every change to prompts, embedding model or index configurati
 
 ## 10. Security and Privacy (important when scanning your whole history)
 
-- **Secret scanning before indexing or LLM calls** (gitleaks/trufflehog rules, plus entropy checks). Redact matches; never store raw secrets in DB, cards or embeddings. Report them so you can rotate them.
-- Per-project flags: `private`, `no_llm` (index locally only), `skip`.
-- Prefer local embedding models for private repos; document exactly what leaves the machine.
-- MCP server binds to localhost, read-only by default; mutating tools require explicit config.
-- RE sandbox: containers with no network, read-only mounts, resource limits.
+- **Secret scanning before indexing or LLM calls** (gitleaks rules as a Go library, plus entropy checks). Redact matches; never store raw secrets in DB, cards, embeddings or the exact-search index. Report them so you can rotate them. Redaction is **one pipeline stage** that every sink consumes (DB, search index, LLM bundle, embeddings). Sinks never run their own check.
+- **Redact on egress too:** every MCP response that contains source text is re-scanned at read time (§15.2.4).
+- Per-project flags: `private`, `no_llm` (index locally only), `skip`. Card quarantine is per-card state, not a flag (§15.4).
+- Prefer local embedding models for private repos (default: bge-m3 on local Ollama); document exactly what leaves the machine in `docs/decisions.md`.
+- **MCP server uses stdio transport** (no network listener), read-only by default; mutating tools (`scan`, `rescan_all`, `recover`) are disabled unless enabled in config, and `scan` only accepts paths under registered roots. All code-returning tools follow §15.2.
+- **`necro forget <project>`** purges a project from Postgres *and* every derived index/cache in one command, for when a secret slips through.
+- Test fixtures with planted fake secrets live under `testdata/` and are allowlisted by path in `.gitleaks.toml` (`[allowlist] paths`, extending the default rules), so CI's repo-level gitleaks run stays meaningful everywhere else. The scanner's own tests load the default rules without that allowlist.
+- RE sandbox: containers with `--network=none`, `--read-only`, `--cap-drop=ALL`, default seccomp, non-root user, read-only input mounts, CPU/memory/time limits.
 - Legal: reverse engineering only for your own software or where you have clear authorization.
-- Encrypt backups; keep the Postgres volume off shared drives.
+- Encrypt backups (e.g. `pg_dump | age -r <recipient>`); keep the Postgres volume off shared drives; Postgres and Ollama bind to `127.0.0.1` only.
 
 ---
 
@@ -404,19 +410,30 @@ Re-run the eval on every change to prompts, embedding model or index configurati
 ```
 necropolis/
 ├─ README.md
-├─ docs/            decisions.md, card-schema.md, prompts/
-├─ migrations/
-├─ crates/
-│  ├─ scanner/      discovery, tree-sitter, git facts, secret scan
-│  ├─ index/        Tantivy builder/query
-│  ├─ mcp/          MCP server (or py/ if prototyped in Python)
-│  └─ re-adapters/  decompiler wrappers, binary helpers
-├─ py/
-│  ├─ summarizer/   bundle builder, prompts, validation, cache
-│  ├─ embeddings/
-│  └─ eval/
-├─ schemas/         card.schema.json, idea.schema.json
-├─ docker-compose.yml
+├─ go.mod
+├─ cmd/
+│  └─ necro/          single binary: CLI subcommands + `necro mcp` (stdio server)
+├─ internal/
+│  ├─ config/         necro.toml loading, roots, flags, denylist
+│  ├─ discovery/      walk roots, detect repos, .gitignore, dedupe by root_commit
+│  ├─ scanner/        manifests, git facts, fingerprint + stat cache
+│  ├─ parse/          tree-sitter (cgo), tags.scm / import queries, vendored grammars
+│  ├─ redact/         gitleaks library + entropy; the ONE redaction stage for every sink
+│  ├─ gitx/           hardened git invocation (SHA-only, fixed args, timeouts) (§15.2.7)
+│  ├─ sandbox/        os.Root-based file access, denylist enforcement (§15.2)
+│  ├─ store/          pgx repository layer
+│  ├─ llm/            LLMProvider interface + Gemini implementation
+│  ├─ embed/          Embedder interface + Ollama (bge-m3) implementation
+│  ├─ summarizer/     bundle builder, prompts, schema validation, card lint (§15.3)
+│  ├─ mcp/            tool handlers, provenance envelope, caps, audit log
+│  ├─ search/         Phase 4 exact-search backend (chosen by benchmark)
+│  └─ recover/        Phase 6 RE adapters (sandboxed containers)
+├─ migrations/        goose plain-SQL migrations (00001_init.sql = §15.4)
+├─ schemas/           card.schema.json, idea.schema.json, samples/
+├─ testdata/          planted-secret repos, injection corpus, traversal fixtures
+├─ docs/              decisions.md, card-schema.md, prompts/
+├─ eval/              questions.yaml (+ optional Python notebooks/harness)
+├─ docker-compose.yml postgres16+pgvector, ollama (both bound to 127.0.0.1)
 ├─ Makefile
 └─ necro.toml.example
 ```
@@ -427,12 +444,15 @@ necropolis/
 
 | Risk | Mitigation |
 |---|---|
-| Cards become stale or wrong | Commit-hash cache, `--stale` rescan, accuracy spot-checks, card_version |
+| Cards become stale or wrong | Content-fingerprint cache (§15.4), `--stale` rescan, accuracy spot-checks, `prompt_version` / `schema_version` in the cache key |
 | LLM cost creep | Token budgets per bundle, caching, tiering (cheap model for bundles, better model for cards), cost logging |
-| Over-engineering the stack | Phase gates: Tantivy only in Phase 4, Qdrant only if measured need |
-| Embedding model change invalidates vectors | Store model name/dim; re-embed job; never mix |
-| Decompiler output is poor (esp. Flutter AOT) | Set expectations: structure + plan, not source; show confidence per file |
-| Secrets leak into index/LLM | Mandatory redaction step, `no_llm` flag, local embeddings |
+| Over-engineering the stack | Phase gates: exact-search engine only in Phase 4 after a benchmark, Qdrant only if measured need |
+| Embedding model change invalidates vectors | `embedding_model` table with one active model; `embedding_model_id` on every vector; re-embed job; never mix |
+| Decompiler output is poor (esp. Flutter AOT) | Set expectations: structure + plan, not source; show confidence per file; check Blutter's supported Dart version early |
+| Secrets leak into index/LLM/agent | One redaction stage feeding every sink, redact-on-egress for every tool response (§15.2.4), `no_llm` flag, local embeddings, `necro forget` purge |
+| Path traversal / git argument injection via MCP | Indexed-files-only pointers, `os.Root`, denylist, SHA-only commits, `git cat-file` with fixed args (§15.2) |
+| Stored prompt injection via cards | Untrusted-data prompt framing, schema-enforced output, deterministic lint, per-card quarantine, provenance envelope (§15.3) |
+| cgo / tree-sitter build friction | Native per-OS CI builds or `zig cc`; grammars vendored and pinned |
 | Scope explosion (RE is its own product) | RE is isolated in Phase 6; Phases 0–5 ship value without it |
 
 ---
@@ -471,14 +491,16 @@ Where this section conflicts with anything above, this section wins.
 
 | Topic | Decision | Notes |
 |---|---|---|
-| Core language | **Go** | Single binary, pgx, official MCP SDK, `os.Root` for path sandboxing, easy cross-compile. Matches the Go + Python focus for security work. Drops the "prototype in Python, port to Rust" plan, since a port is wasted work. Tree-sitter via cgo is the one rough edge. |
-| Migrations | goose, plain SQL | |
-| Card LLM | **Gemini**, behind an `LLMProvider` interface | Pin the exact model id in each card's metadata. A free/local provider can be added later without touching the pipeline. |
-| Embeddings | `Embedder` interface; **default proposal: bge-m3 local** (1024-dim, matches the current schema) | Confirm in Phase 0. A Gemini embedding model is a valid alternative, but it needs its own index. Never mix models in one index. |
-| Exact search (Phase 4) | Benchmark three options, pick one | (a) ParadeDB `pg_search`, BM25 inside Postgres, removes the sync problem; (b) a small Rust Tantivy sidecar; (c) Bleve, pure Go. Verify the current state of each before choosing. |
-| Languages first | Dart, Kotlin, Swift, plus Rust/Go/Python/TS | Confirm with the histogram in §14.6. Grammars are pluggable, so the order only affects what ships first. |
+| Core language | **Go** | Single binary, pgx, official MCP SDK (`github.com/modelcontextprotocol/go-sdk`), `os.Root` for path sandboxing. Matches the Go + Python focus for security work. Drops the "prototype in Python, port to Rust" plan, since a port is wasted work. **Cross-compiling is not "easy":** tree-sitter brings in cgo (`github.com/tree-sitter/go-tree-sitter`, with grammars vendored). Release builds run natively on each OS in a CI matrix, or use `zig cc` as the cross C toolchain. |
+| Migrations | goose, plain SQL | One authoritative `00001_init.sql` (§15.4). |
+| Card LLM | **Gemini, paid tier (or Vertex AI) from day one**, behind an `LLMProvider` interface | SDK `google.golang.org/genai`. Card output is enforced through `ResponseSchema` (structured output) *and* re-validated locally. Pin the exact model id in each card row. A free/local provider can be added later without touching the pipeline. |
+| Embeddings | `Embedder` interface; **bge-m3 (1024-dim) served by Ollama** | Runs as a container in `docker-compose`, bound to `127.0.0.1`, reached over HTTP. Nothing leaves the machine, so it's safe for `private` repos. Registered as the single active row in `embedding_model`. Hugging Face TEI is a drop-in alternative behind the same interface. Never mix models in one index. |
+| Secret scanning | **gitleaks as a Go library** (`github.com/zricethezav/gitleaks/v8/detect`), version pinned | Runs in-process, because redact-on-egress (§15.2.4) runs on every tool call and launching a CLI each time is too slow. The library API isn't stable, so pin it and cover it with the planted-secret tests. Add an entropy pass for literals. |
+| MCP transport | **stdio** | No network listener at all. HTTP transport only if a remote agent ever needs it, and then with auth and a localhost bind. |
+| Exact search (Phase 4) | Benchmark three options, pick one | (a) ParadeDB `pg_search`, BM25 inside Postgres, removes the sync problem; note it is **AGPL** (fine for personal use) and needs the ParadeDB Postgres image, which is a one-line compose change; (b) a small Rust Tantivy sidecar; (c) Bleve, pure Go. Verify the current state of each before choosing. |
+| Languages first | Dart, Kotlin, Swift, plus Rust/Go/Python/TS | Confirm with the histogram in §14.6. Grammars are pluggable, so the order only affects what ships first. Symbols are extracted through each grammar's `tags.scm` queries, so one generic extractor covers definitions; imports need small per-language queries. |
 
-**Gemini privacy:** free-tier API inputs may be used by the provider to improve its products, per its terms. Check the current terms for the tier in use. Until then, treat every LLM call as an egress point: redaction runs first, and `no_llm` projects never reach the provider.
+**Gemini privacy:** the free tier may use inputs to improve the provider's products, so it is **not used**, not even in development. Use the paid API or Vertex AI and re-check the terms whenever the tier changes. Every LLM call is still treated as an egress point: redaction runs first, and `no_llm` projects never reach the provider.
 
 ### 15.2 `get_pointer` hardening (and all code-returning tools)
 
@@ -487,7 +509,12 @@ Where this section conflicts with anything above, this section wins.
 3. **Denylist** regardless of index state: `.env*`, `*.pem`, `*.key`, `id_rsa*`, `.ssh/`, `.aws/`, `.git/`, keystores, `*.p12`, `google-services.json`, `.npmrc`, `.netrc`, and similar. Maintain it in config.
 4. **Redact on egress.** Run the secret scanner over every returned snippet at read time, not only at index time. Replace matches with `[REDACTED:type]`. The same applies to `get_module`, `find_string`, and any tool that returns source text.
 5. **Caps:** max 200 lines per call, max N calls per session, and an audit log of every call (who, what, when).
-6. **Tests (required before Phase 3 exits):** `../../.ssh/id_rsa`, absolute paths, symlink escape, a file containing a planted fake AWS key, and a request for an unindexed file must all fail or return redacted output.
+6. **Tests (required before Phase 3 exits):** `../../.ssh/id_rsa`, absolute paths, symlink escape, a file containing a planted fake AWS key, a request for an unindexed file, and the git argument-injection cases in item 7 must all fail or return redacted output.
+7. **No argument injection into git.** A caller-supplied commit is a classic injection point: `git show --output=/home/you/.bashrc` turns a read into a file write, and values like `--exec`, `-c core.pager=…` or a ref named `--help` behave in similar ways.
+   - Accept a commit only if it matches `^[0-9a-f]{40}$|^[0-9a-f]{64}$` (SHA-1 / SHA-256). Never accept branch names, `HEAD~n` or other revision syntax from agents. Resolve those server-side if they're needed at all.
+   - Confirm that the object exists and is a commit (`git cat-file -t <sha>` must equal `commit`) before using it.
+   - Prefer `git cat-file blob <sha>:<path>`, which has no `--output` style options, over `git show`. Build the arguments with `exec.CommandContext`, never through a shell. Pin `-c core.pager=cat -c core.fsmonitor= -c protocol.allow=never`, and set the `GIT_CONFIG_NOSYSTEM=1` and `GIT_TERMINAL_PROMPT=0` environment variables.
+   - The path part comes from the `file` table (item 1), never from the request. A timeout and an output size cap apply to every git invocation.
 
 ### 15.3 Prompt-injection defenses for cards
 
@@ -497,6 +524,7 @@ Repo content, READMEs, comments and decompiled third-party strings are untrusted
 2. **Prompt structure:** untrusted content sits inside clearly delimited data blocks; the system prompt states that it is data and that any instructions inside it must be ignored and reported.
 3. **Constrained output:** strict JSON schema with enums where possible, hard length caps per field, no free-form "instructions" or "notes to the agent" fields.
 4. **Deterministic lint after generation:** reject or quarantine cards whose fields contain instruction-like patterns ("ignore previous", "you must", "system prompt", tool names, shell commands), URLs outside an allowlist, or base64-like blobs. Quarantined cards are not served until reviewed (`necro review`).
+   - **False positives:** developer gotchas often contain legitimate commands (`flutter pub get`, `xcrun simctl …`). Commands go into a typed `commands: [string]` card field (≤ 5 entries, ≤ 120 chars each). That field is checked against a denylist (pipes to a shell, `curl … | sh`, `rm -rf`, redirection into dotfiles, encoded payloads) and is always rendered as an inert code block, never as prose. Shell-command patterns are only flagged in the prose fields. Measure the quarantine rate on the real corpus during Phase 2 and tune from that (§15.5).
 5. **Provenance envelope:** every MCP response wraps card content as `untrusted_derived_data: true`, with the source fingerprint and a note that nothing inside is an instruction. Agents should be told this in the server's tool descriptions.
 6. **Free-text fields are the weak point** (`why_stopped`, `gotchas`, idea summaries). Keep them short and plain; consider structured tags instead of prose where possible.
 7. **Synthetic (reverse-engineered) repos** get the strictest mode: bundles built from strings only after filtering, and cards always start in quarantine.
@@ -509,37 +537,214 @@ This reduces risk but cannot reach zero, so the provenance envelope and the quar
 Commit hash is not a valid cache key for dirty working trees, non-git folders, or synthetic repos.
 
 - **Fingerprint** = SHA-256 over the sorted list of `(relpath, content_hash)` for every non-ignored file (tracked and untracked), plus the scanner config version.
+- **Stat cache (required for the <2 s no-op rescan):** keep `(mtime_ns, size, inode)` per file next to its `content_hash`, the same way git's index does. Re-hash a file only when its stat tuple changes, then recompute the fingerprint from the cached hashes. Go further for clean git repos: when `HEAD` and the `git status --porcelain` output are both unchanged since the last scan, skip the filesystem walk.
 - **Synthetic repos:** artifact SHA-256 + adapter name/version + toolchain versions + recovery config.
 - **Cache key** = `(fingerprint, prompt_version, model_id, schema_version)`.
 - The git commit is display metadata only.
 
+**Authoritative initial schema (`migrations/00001_init.sql`).** This replaces §5.2 and the earlier `ALTER TABLE` sketch. The project is new, so there is one init migration rather than a base migration plus patches.
+
 ```sql
-ALTER TABLE project
-  ADD COLUMN source_kind  TEXT NOT NULL DEFAULT 'git_clean',  -- git_clean | git_dirty | plain_dir | synthetic
-  ADD COLUMN fingerprint  TEXT,
-  ADD COLUMN flags        TEXT[] NOT NULL DEFAULT '{}',        -- private | no_llm | skip | quarantined
-  ADD COLUMN root_id      TEXT;                                -- registered root used for path sandboxing
+-- +goose Up
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
+-- Registered scan roots. Path sandboxing (§15.2) is anchored here.
+CREATE TABLE root (
+  id         TEXT PRIMARY KEY,                     -- ULID
+  path       TEXT NOT NULL UNIQUE,                 -- absolute, canonicalized at registration
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE project (
+  id             TEXT PRIMARY KEY,                 -- ULID
+  root_id        TEXT NOT NULL REFERENCES root(id) ON DELETE RESTRICT,
+  name           TEXT NOT NULL,
+  rel_path       TEXT NOT NULL,                    -- relative to root.path; never absolute
+  remote_url     TEXT,
+  root_commit    TEXT,                             -- first commit SHA; dedupes duplicate clones
+  source_kind    TEXT NOT NULL DEFAULT 'git_clean'
+                 CHECK (source_kind IN ('git_clean','git_dirty','plain_dir','synthetic')),
+  status         TEXT NOT NULL DEFAULT 'unknown'
+                 CHECK (status IN ('unknown','active','finished','abandoned','archived','recovered')),
+  status_source  TEXT NOT NULL DEFAULT 'deterministic'
+                 CHECK (status_source IN ('deterministic','llm','human')),
+  flags          TEXT[] NOT NULL DEFAULT '{}'      -- user config only: private | no_llm | skip
+                 CHECK (flags <@ ARRAY['private','no_llm','skip']::TEXT[]),
+  languages      TEXT[] NOT NULL DEFAULT '{}',
+  stack          TEXT[] NOT NULL DEFAULT '{}',
+  head_commit    TEXT,                             -- display metadata only
+  fingerprint    TEXT,
+  last_scanned   TIMESTAMPTZ,
+  UNIQUE (root_id, rel_path)
+);
+CREATE INDEX project_root_commit ON project (root_commit);
+
+CREATE TABLE file (
+  id           BIGSERIAL PRIMARY KEY,
+  project_id   TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  path         TEXT NOT NULL,                      -- relative to project root
+  lang         TEXT,
+  role         TEXT,
+  content_hash TEXT NOT NULL,
+  mtime_ns     BIGINT,                             -- stat cache
+  size_bytes   BIGINT,
+  inode        BIGINT,
+  loc          INT,
+  redactions   INT NOT NULL DEFAULT 0,
+  UNIQUE (project_id, path)
+);
+CREATE INDEX file_path_trgm ON file USING gin (path gin_trgm_ops);
+
+CREATE TABLE symbol (
+  id         BIGSERIAL PRIMARY KEY,
+  file_id    BIGINT NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL,
+  kind       TEXT NOT NULL
+             CHECK (kind IN ('class','fn','method','const','type','field','enum','interface')),
+  start_line INT NOT NULL,
+  end_line   INT NOT NULL CHECK (end_line >= start_line),
+  signature  TEXT                                  -- post-redaction only
+);
+CREATE INDEX symbol_file       ON symbol (file_id);
+CREATE INDEX symbol_name_exact ON symbol (name text_pattern_ops);  -- exact + prefix
+CREATE INDEX symbol_name_trgm  ON symbol USING gin (name gin_trgm_ops);
+
+CREATE TABLE edge (
+  id       BIGSERIAL PRIMARY KEY,
+  src_file BIGINT NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+  dst_file BIGINT REFERENCES file(id) ON DELETE CASCADE,
+  dst_ext  TEXT,
+  kind     TEXT NOT NULL CHECK (kind IN ('import','call','extends')),
+  CHECK ((dst_file IS NULL) <> (dst_ext IS NULL))  -- exactly one target
+);
+CREATE INDEX edge_src ON edge (src_file);
+CREATE INDEX edge_dst ON edge (dst_file);
+CREATE INDEX edge_ext ON edge (dst_ext);
+
+-- Exactly one active model at a time; switching models = new row + re-embed job.
 CREATE TABLE embedding_model (
-  id        SERIAL PRIMARY KEY,
-  name      TEXT NOT NULL UNIQUE,        -- e.g. bge-m3
-  dim       INT  NOT NULL,
-  provider  TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT now()
+  id         SERIAL PRIMARY KEY,
+  name       TEXT NOT NULL UNIQUE,                 -- e.g. bge-m3
+  provider   TEXT NOT NULL,                        -- e.g. ollama
+  dim        INT  NOT NULL,
+  active     BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
--- idea/chunk embeddings carry model_id; a new model means a new column/table + re-embed job.
+CREATE UNIQUE INDEX embedding_model_one_active ON embedding_model (active) WHERE active;
 
-CREATE TABLE card_cache (
-  project_id TEXT, fingerprint TEXT, prompt_version INT, model_id TEXT, schema_version INT,
-  card JSONB, created_at TIMESTAMPTZ DEFAULT now(),
-  PRIMARY KEY (project_id, fingerprint, prompt_version, model_id, schema_version)
+CREATE TABLE idea (
+  id                 BIGSERIAL PRIMARY KEY,
+  project_id         TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  title              TEXT NOT NULL CHECK (length(title) <= 120),
+  summary            TEXT NOT NULL CHECK (length(summary) <= 600),
+  tags               TEXT[] NOT NULL DEFAULT '{}',
+  pointers           JSONB NOT NULL,               -- [{file_id, start, end, fingerprint}]
+  embedding_model_id INT REFERENCES embedding_model(id),
+  embedding          vector(1024),                 -- dim locked to bge-m3; new dim = new migration
+  CHECK ((embedding IS NULL) = (embedding_model_id IS NULL))
 );
+CREATE INDEX idea_embedding_hnsw ON idea USING hnsw (embedding vector_cosine_ops);
+
+CREATE TABLE chunk (                               -- optional L1 semantic chunks (Phase 3)
+  id                 BIGSERIAL PRIMARY KEY,
+  file_id            BIGINT NOT NULL REFERENCES file(id) ON DELETE CASCADE,
+  start_line         INT NOT NULL,
+  end_line           INT NOT NULL CHECK (end_line >= start_line),
+  summary            TEXT,
+  embedding_model_id INT REFERENCES embedding_model(id),
+  embedding          vector(1024),
+  CHECK ((embedding IS NULL) = (embedding_model_id IS NULL))
+);
+CREATE INDEX chunk_embedding_hnsw ON chunk USING hnsw (embedding vector_cosine_ops);
+
+-- Every generated card. Quarantine is a per-card state, not a project flag.
+CREATE TABLE card (
+  id             BIGSERIAL PRIMARY KEY,
+  project_id     TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  fingerprint    TEXT NOT NULL,
+  prompt_version INT  NOT NULL,
+  model_id       TEXT NOT NULL,                    -- exact LLM model id
+  schema_version INT  NOT NULL,
+  body           JSONB NOT NULL,
+  tokens         INT  NOT NULL,
+  status         TEXT NOT NULL DEFAULT 'quarantined'
+                 CHECK (status IN ('quarantined','approved','rejected')),
+  lint_findings  JSONB NOT NULL DEFAULT '[]',
+  reviewed_at    TIMESTAMPTZ,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (project_id, fingerprint, prompt_version, model_id, schema_version)
+);
+CREATE INDEX card_serving ON card (project_id, created_at DESC) WHERE status = 'approved';
+
+CREATE TABLE scan_run (
+  id             BIGSERIAL PRIMARY KEY,
+  project_id     TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  fingerprint    TEXT,
+  head_commit    TEXT,
+  started_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at    TIMESTAMPTZ,
+  llm_model      TEXT,
+  llm_tokens_in  INT,
+  llm_tokens_out INT,
+  secrets_found  INT NOT NULL DEFAULT 0,
+  status         TEXT NOT NULL CHECK (status IN ('running','ok','failed','skipped'))
+);
+CREATE INDEX scan_run_project ON scan_run (project_id, started_at DESC);
+
+-- Append-only audit of every MCP tool call (§15.2.5).
+CREATE TABLE audit_log (
+  id         BIGSERIAL PRIMARY KEY,
+  at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  client     TEXT,                                 -- MCP clientInfo from initialize
+  session_id TEXT NOT NULL,
+  tool       TEXT NOT NULL,
+  args       JSONB NOT NULL,                       -- post-redaction
+  outcome    TEXT NOT NULL CHECK (outcome IN ('ok','denied','error')),
+  reason     TEXT
+);
+-- The application DB role gets INSERT/SELECT only on audit_log, with no UPDATE/DELETE.
+
+CREATE TABLE meta (key TEXT PRIMARY KEY, value JSONB NOT NULL);  -- tokenizer, schema versions
+
+-- +goose Down
+DROP TABLE IF EXISTS meta, audit_log, scan_run, card, chunk, idea, embedding_model,
+  edge, symbol, file, project, root CASCADE;
 ```
 
-The card field `source_commit` becomes `source_fingerprint` (plus an optional `git_commit`). Phase 1 stores `fingerprint`; Phase 2 reads it.
+Notes:
+- An "L0 card" is served as the newest `card` row with `status = 'approved'` for the project. The old `project.card*` columns are gone. Synthetic-repo cards stay `quarantined` until `necro review` approves them (§15.3.7). Normal cards are approved automatically when the lint finds nothing.
+- `project.rel_path` + `root.path` replaces `root_uri`, so no stored value is ever an absolute path an agent can influence.
+- The card field `source_commit` becomes `source_fingerprint` (plus an optional `git_commit`). Phase 1 stores `fingerprint`; Phase 2 reads it.
 
 ### 15.5 Additional exit criteria
 
-- **Phase 1:** dirty-tree and non-git-folder scans produce stable fingerprints; the secret scanner passes a planted-secret test.
-- **Phase 2:** the injection corpus (§15.3.8) is clean; every card carries model id, prompt version and fingerprint.
-- **Phase 3:** all §15.2.6 tests pass before the MCP server is connected to any agent.
+- **Phase 0:** `goose up` / `goose down` / `goose up` round-trips cleanly in CI against an ephemeral Postgres.
+- **Phase 1:** dirty-tree and non-git-folder scans produce stable fingerprints; the secret scanner passes a planted-secret test; a no-op rescan of a 5k-file repo finishes in < 2 s and makes zero content reads (verified through the stat cache counters).
+- **Phase 2:** the injection corpus (§15.3.8) is clean; every card carries model id, prompt version and fingerprint; the lint false-positive rate on your real corpus is measured and recorded (§15.3.4).
+- **Phase 3:** all §15.2.6 tests pass, including the git argument-injection cases, before the MCP server is connected to any agent.
+
+---
+
+## 16. Revision 3: Review Findings Applied (authoritative)
+
+An external review of Revision 2 checked the plan against the code that will be written from it. Each finding was confirmed valid and is fixed in place above. Where §16 and §15 differ, §16 wins.
+
+| # | Finding | Status | Fixed in |
+|---|---|---|---|
+| R1 | Pre-§15 sections still described the Rust/Python split, commit-hash caching and a localhost listener; §11 would have been copied straight into the scaffold | Fixed | §10, §11, §12, §5.2 banner |
+| R2 | `git show <commit>:<path>` with a caller-supplied commit allowed **argument injection** (e.g. `--output=<file>` turns a read into a file write) | Fixed | §15.2.7 |
+| R3 | The fingerprint re-hashed every file, so the <2 s no-op rescan target was unreachable | Fixed: stat cache + git short-circuit | §15.4, §15.5 |
+| R4 | The schema was a base migration plus `ALTER`s; the review's fixes (NOT NULL FKs, FK on `edge.dst_file`, edge indexes, CHECKs, FK on `scan_run`, prefix index on `symbol.name`) were missing; `root_id` pointed at no table; embeddings had no `model_id` column; `card_cache` had no constraints | Fixed: one authoritative `00001_init.sql` | §15.4 |
+| R5 | `quarantined` was a project flag, but quarantine is a per-card state | Fixed: `card.status` | §15.4 |
+| R6 | Nothing said how bge-m3 actually runs from Go | Fixed: Ollama container behind `Embedder` | §15.1 |
+| R7 | The Gemini tier was left "check later" even though the free tier may use inputs for training | Fixed: paid tier / Vertex from day one; `ResponseSchema`-enforced output | §15.1 |
+| R8 | Redact-on-egress runs on every tool call, so shelling out to the gitleaks CLI is too slow | Fixed: gitleaks imported as a Go library, version pinned | §15.1 |
+| R9 | "Easy cross-compile" doesn't hold once tree-sitter brings in cgo | Fixed: native builds or `zig cc` | §15.1 |
+| R10 | The instruction lint will flag legitimate shell commands that developers write in gotchas | Mitigated: typed `commands[]` field + measured FP rate | §15.3.4, §15.5 |
+| R11 | ParadeDB `pg_search` is AGPL and needs its own Postgres image | Noted; deferred to the Phase 4 benchmark | §15.1 |
+| R12 | Agents get no value until week 3 | Optional thin slice documented; timeline unchanged | §16.1 |
+
+### 16.1 Optional week-1 thin slice
+
+If agent value is wanted before week 3, reorder (without changing the architecture): discovery + manifests + git facts + gitleaks → Gemini L0 card → MCP `list_projects` + `get_card` over stdio, all in week 1; tree-sitter symbols in week 2; ideas, embeddings and `search_ideas` in weeks 2–3. Every §15.2 / §15.3 control still applies to the slice.
