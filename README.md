@@ -3,7 +3,7 @@
 Name: **Necropolis** (official)
 Owner: Anas Ghareib
 Status: Planning → Phase 0 (blueprint ready to scaffold)
-Last updated: 2026-10-16 (Revision 3; see §16. Precedence: §16 > §15 > earlier sections)
+Last updated: 2026-10-16 (Revision 4: pure Rust core; see §16 > §15 > earlier sections)
 
 ---
 
@@ -131,7 +131,7 @@ source_commit: 9f3c2ab
 ### 5.2 Postgres schema (initial, superseded)
 
 > [!WARNING]
-> **Superseded by §15.4.** This is kept to show how the design evolved. Do not scaffold from it: it has nullable foreign keys, no FK on `edge.dst_file`, commit-based caching, and no `root`, `card`, `embedding_model` or `audit_log` tables. The authoritative `migrations/00001_init.sql` is in §15.4.
+> **Superseded by §15.4.** This is kept to show how the design evolved. Do not scaffold from it: it has nullable foreign keys, no FK on `edge.dst_file`, commit-based caching, and no `root`, `card`, `embedding_model` or `audit_log` tables. The authoritative `migrations/0001_init.up.sql` is in §15.4.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -218,22 +218,22 @@ Embedding dimension depends on the model chosen in Phase 3. Lock it per index an
             └──────┬────────┘
                    ▼
             ┌───────────────┐
-            │  Scanner      │  tree-sitter, manifests, git log, secret scan   (Go)
+            │  Scanner      │  tree-sitter, manifests, git log, secret scan   (Rust)
             └──────┬────────┘
                    ▼
             ┌───────────────┐
-            │  Summarizer   │  LLM: L0 card + idea records, cached by fingerprint (Go)
+            │  Summarizer   │  LLM: L0 card + idea records, cached by fingerprint (Rust)
             └──────┬────────┘
                    ▼
    ┌──────────────────────────────────────────┐
    │ Postgres (truth) + pgvector              │
-   │   └─► Tantivy index (derived)            │
+   │   └─► Tantivy index (derived, in-process)│
    │   └─► LanceDB snapshot (derived, opt.)   │
    │   └─► Parquet export → DuckDB (analytics)│
    └──────────────────┬───────────────────────┘
                       ▼
             ┌───────────────┐
-            │  MCP server   │  tools below                                    (Go)
+            │  MCP server   │  tools below                                    (Rust)
             └──────┬────────┘
                    ▼
         Claude Code / other agents
@@ -241,11 +241,9 @@ Embedding dimension depends on the model chosen in Phase 3. Lock it per index an
  RE branch:  artifact ─► Decompile ─► Normalize ─► "synthetic repo" ─► Scanner (same path)
 ```
 
-### Language split
-- **Go (core, single binary):** scanner, summarizer/LLM orchestration, embedding calls, MCP server, file watcher, RE adapters. No port step later.
-- **Python (optional, outside the core):** eval harness and notebooks only.
-- **Rust (only if Phase 4 needs it):** a small Tantivy sidecar. See §15.1.
-- See §15 for the reasoning; it supersedes any earlier Rust/Python split.
+### Language choice
+- **Rust (100% of the core, single `necro` binary via Cargo workspace):** scanner, tree-sitter parsing, Tantivy indexing (native in-process, no sidecar), summarizer/LLM orchestration, embedding calls, MCP server (`rmcp`), file watcher (`notify`), binary parsing (`goblin`, `object`, `capstone`), and RE adapters. No Python or Go in the core, and no port step later.
+- See §15 and §16 for the resolved architecture and crate selections.
 
 ---
 
@@ -256,7 +254,7 @@ Embedding dimension depends on the model chosen in Phase 3. Lock it per index an
 | `list_projects(filter?)` | Names, one-liners, status | ≤ 40 tokens/project |
 | `get_card(project)` | L0 card | ≤ 600 tokens |
 | `search_ideas(query, filters?, k)` | Semantic search over ideas (pgvector) | ≤ 150 tokens/hit |
-| `find_symbol(name, kind?)` | Exact/prefix identifier lookup (Tantivy) | ≤ 60 tokens/hit |
+| `find_symbol(name, kind?)` | Exact/prefix identifier lookup (Postgres in P3, Tantivy in P4) | ≤ 60 tokens/hit |
 | `find_string(text)` | Error strings, config keys, literals | ≤ 60 tokens/hit |
 | `find_path(pattern)` | File path lookup | ≤ 40 tokens/hit |
 | `get_module(project, module)` | L1 module summary + deps | ≤ 300 tokens |
@@ -274,9 +272,9 @@ Every tool returns a `token_estimate` so agents can budget. Default `k` is 5.
 Each phase ends in something usable. Don't start the next phase until the exit criteria pass.
 
 ### Phase 0 — Foundations (2–3 days)
-- Repo layout, license, CI (fmt, lint, tests).
-- `docker compose` with Postgres 16 + pgvector.
-- Migrations with goose (plain SQL) + pgx, initial schema from §5.2 as amended by §15.4.
+- Cargo workspace layout, license, CI (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`).
+- `docker compose` with Postgres 16 + pgvector (and Ollama for local `bge-m3`).
+- Migrations with `sqlx-cli` (`sqlx migrate run` / `revert`, or embedded via `sqlx::migrate!()`), initial schema from §15.4.
 - Define card/idea JSON schemas and a golden-sample set of 5 hand-written cards.
 - Lock the embedding model and the card LLM now (not in Phase 3); record in `docs/decisions.md` and the `embedding_model` table (§15.1, §15.4).
 
@@ -392,10 +390,10 @@ Re-run the eval on every change to prompts, embedding model or index configurati
 
 ## 10. Security and Privacy (important when scanning your whole history)
 
-- **Secret scanning before indexing or LLM calls** (gitleaks rules as a Go library, plus entropy checks). Redact matches; never store raw secrets in DB, cards, embeddings or the exact-search index. Report them so you can rotate them. Redaction is **one pipeline stage** that every sink consumes (DB, search index, LLM bundle, embeddings). Sinks never run their own check.
+- **Secret scanning before indexing or LLM calls** (in-process Rust regex rule engine compiled from the `gitleaks.toml` rule set via `regex::RegexSet` + `aho-corasick` prefilter, plus Shannon entropy checks). Redact matches; never store raw secrets in DB, cards, embeddings or the exact-search index. Report them so you can rotate them. Redaction is **one pipeline stage** (`necro-redact`) that every sink consumes (DB, Tantivy index, LLM bundle, embeddings). Sinks never run their own check.
 - **Redact on egress too:** every MCP response that contains source text is re-scanned at read time (§15.2.4).
 - Per-project flags: `private`, `no_llm` (index locally only), `skip`. Card quarantine is per-card state, not a flag (§15.4).
-- Prefer local embedding models for private repos (default: bge-m3 on local Ollama); document exactly what leaves the machine in `docs/decisions.md`.
+- Prefer local embedding models for private repos (default: `bge-m3` via Ollama or embedded `fastembed`); document exactly what leaves the machine in `docs/decisions.md`.
 - **MCP server uses stdio transport** (no network listener), read-only by default; mutating tools (`scan`, `rescan_all`, `recover`) are disabled unless enabled in config, and `scan` only accepts paths under registered roots. All code-returning tools follow §15.2.
 - **`necro forget <project>`** purges a project from Postgres *and* every derived index/cache in one command, for when a secret slips through.
 - Test fixtures with planted fake secrets live under `testdata/` and are allowlisted by path in `.gitleaks.toml` (`[allowlist] paths`, extending the default rules), so CI's repo-level gitleaks run stays meaningful everywhere else. The scanner's own tests load the default rules without that allowlist.
@@ -410,30 +408,30 @@ Re-run the eval on every change to prompts, embedding model or index configurati
 ```
 necropolis/
 ├─ README.md
-├─ go.mod
-├─ cmd/
-│  └─ necro/          single binary: CLI subcommands + `necro mcp` (stdio server)
-├─ internal/
-│  ├─ config/         necro.toml loading, roots, flags, denylist
-│  ├─ discovery/      walk roots, detect repos, .gitignore, dedupe by root_commit
-│  ├─ scanner/        manifests, git facts, fingerprint + stat cache
-│  ├─ parse/          tree-sitter (cgo), tags.scm / import queries, vendored grammars
-│  ├─ redact/         gitleaks library + entropy; the ONE redaction stage for every sink
-│  ├─ gitx/           hardened git invocation (SHA-only, fixed args, timeouts) (§15.2.7)
-│  ├─ sandbox/        os.Root-based file access, denylist enforcement (§15.2)
-│  ├─ store/          pgx repository layer
-│  ├─ llm/            LLMProvider interface + Gemini implementation
-│  ├─ embed/          Embedder interface + Ollama (bge-m3) implementation
-│  ├─ summarizer/     bundle builder, prompts, schema validation, card lint (§15.3)
-│  ├─ mcp/            tool handlers, provenance envelope, caps, audit log
-│  ├─ search/         Phase 4 exact-search backend (chosen by benchmark)
-│  └─ recover/        Phase 6 RE adapters (sandboxed containers)
-├─ migrations/        goose plain-SQL migrations (00001_init.sql = §15.4)
-├─ schemas/           card.schema.json, idea.schema.json, samples/
-├─ testdata/          planted-secret repos, injection corpus, traversal fixtures
-├─ docs/              decisions.md, card-schema.md, prompts/
-├─ eval/              questions.yaml (+ optional Python notebooks/harness)
-├─ docker-compose.yml postgres16+pgvector, ollama (both bound to 127.0.0.1)
+├─ Cargo.toml              workspace root (edition = "2024", shared dependencies & lints)
+├─ Cargo.lock
+├─ crates/
+│  ├─ necro-cli/           single binary `necro`: CLI subcommands (`clap`) + `necro mcp` (stdio server)
+│  ├─ necro-core/          domain types (ULID, Card, Idea, Pointer), config (`necro.toml`), error types
+│  ├─ necro-redact/        gitleaks.toml rule compiler (`RegexSet` + `aho-corasick`) + entropy; ONE redaction stage
+│  ├─ necro-sandbox/       `cap-std::fs::Dir` / `openat2(RESOLVE_BENEATH)` root sandboxing + denylist (§15.2)
+│  ├─ necro-git/           hardened git access (`gix` pure-Rust object store + locked `Command` fallback) (§15.2.7)
+│  ├─ necro-discover/      walk roots (`ignore` crate), detect repos, respect `.gitignore`, dedupe by `root_commit`
+│  ├─ necro-parse/         native `tree-sitter` + `StreamingIterator` over `tags.scm` / import queries, manifest parsers
+│  ├─ necro-scan/          incremental scanner orchestrator, `blake3`/`sha2` fingerprint + stat cache
+│  ├─ necro-store/         `sqlx` (Postgres + `pgvector`) repository layer + embedded migrations
+│  ├─ necro-llm/           `LlmProvider` trait + Gemini structured-output implementation (`reqwest` + `schemars`)
+│  ├─ necro-embed/         `Embedder` trait + Ollama (`bge-m3`) / optional `fastembed` implementation
+│  ├─ necro-summarize/     bundle builder (`tiktoken-rs`), prompts, `jsonschema` validation, card lint (§15.3)
+│  ├─ necro-index/         native embedded `tantivy` index builder & custom tokenizers (Phase 4)
+│  ├─ necro-mcp/           MCP stdio server (`rmcp`), tool handlers, provenance envelope, caps, audit log
+│  └─ necro-recover/       Phase 6 RE adapters (sandboxed containers) + `goblin` / `object` / `capstone`
+├─ migrations/             `sqlx-cli` reversible SQL migrations (`0001_init.up.sql` / `0001_init.down.sql`)
+├─ schemas/                card.schema.json, idea.schema.json, samples/
+├─ testdata/               planted-secret repos, injection corpus, traversal fixtures
+├─ docs/                   decisions.md, card-schema.md, prompts/
+├─ eval/                   questions.yaml (evaluated via `necro eval`)
+├─ docker-compose.yml      postgres16+pgvector, ollama (both bound to 127.0.0.1)
 ├─ Makefile
 └─ necro.toml.example
 ```
@@ -445,14 +443,14 @@ necropolis/
 | Risk | Mitigation |
 |---|---|
 | Cards become stale or wrong | Content-fingerprint cache (§15.4), `--stale` rescan, accuracy spot-checks, `prompt_version` / `schema_version` in the cache key |
-| LLM cost creep | Token budgets per bundle, caching, tiering (cheap model for bundles, better model for cards), cost logging |
-| Over-engineering the stack | Phase gates: exact-search engine only in Phase 4 after a benchmark, Qdrant only if measured need |
+| LLM cost creep | Token budgets per bundle (`tiktoken-rs`), caching, tiering (cheap model for bundles, better model for cards), cost logging |
+| Over-engineering the stack | Phase gates: Tantivy only in Phase 4 (in-process crate, zero extra services), Qdrant only if measured need |
 | Embedding model change invalidates vectors | `embedding_model` table with one active model; `embedding_model_id` on every vector; re-embed job; never mix |
 | Decompiler output is poor (esp. Flutter AOT) | Set expectations: structure + plan, not source; show confidence per file; check Blutter's supported Dart version early |
-| Secrets leak into index/LLM/agent | One redaction stage feeding every sink, redact-on-egress for every tool response (§15.2.4), `no_llm` flag, local embeddings, `necro forget` purge |
-| Path traversal / git argument injection via MCP | Indexed-files-only pointers, `os.Root`, denylist, SHA-only commits, `git cat-file` with fixed args (§15.2) |
+| Secrets leak into index/LLM/agent | One redaction crate (`necro-redact`) feeding every sink, redact-on-egress for every tool response (§15.2.4), `no_llm` flag, local embeddings, `necro forget` purge |
+| Path traversal / git argument injection via MCP | Indexed-files-only pointers, `cap-std::fs::Dir` capability handles, denylist, SHA-only commits, `gix` / `git cat-file` with fixed args (§15.2) |
 | Stored prompt injection via cards | Untrusted-data prompt framing, schema-enforced output, deterministic lint, per-card quarantine, provenance envelope (§15.3) |
-| cgo / tree-sitter build friction | Native per-OS CI builds or `zig cc`; grammars vendored and pinned |
+| C grammar compilation (`cc` crate) | Tree-sitter and its grammars compile cleanly via Cargo's standard `cc` build scripts; cross-compile with `cargo-zigbuild` if needed |
 | Scope explosion (RE is its own product) | RE is isolated in Phase 6; Phases 0–5 ship value without it |
 
 ---
@@ -474,7 +472,7 @@ Phases 0–3 (about 3–4 weeks) deliver the main goal: agents using your old pr
 
 ## 14. First Actions (this week)
 
-1. Create the repo and `docker compose` with Postgres + pgvector.
+1. Create the Cargo workspace and `docker compose` with Postgres + pgvector (and Ollama).
 2. List 10–20 real repos as the test corpus (mix of finished, abandoned, Flutter/Kotlin/Swift/Rust).
 3. Hand-write 3 L0 cards to lock the schema.
 4. Build the Phase 1 scanner against that corpus.
@@ -483,7 +481,7 @@ Phases 0–3 (about 3–4 weeks) deliver the main goal: agents using your old pr
 
 ---
 
-## 15. Revision 2: Resolved Decisions and Hardening (authoritative)
+## 15. Revision 2–4: Resolved Decisions and Hardening (authoritative)
 
 Where this section conflicts with anything above, this section wins.
 
@@ -491,30 +489,30 @@ Where this section conflicts with anything above, this section wins.
 
 | Topic | Decision | Notes |
 |---|---|---|
-| Core language | **Go** | Single binary, pgx, official MCP SDK (`github.com/modelcontextprotocol/go-sdk`), `os.Root` for path sandboxing. Matches the Go + Python focus for security work. Drops the "prototype in Python, port to Rust" plan, since a port is wasted work. **Cross-compiling is not "easy":** tree-sitter brings in cgo (`github.com/tree-sitter/go-tree-sitter`, with grammars vendored). Release builds run natively on each OS in a CI matrix, or use `zig cc` as the cross C toolchain. |
-| Migrations | goose, plain SQL | One authoritative `00001_init.sql` (§15.4). |
-| Card LLM | **Gemini, paid tier (or Vertex AI) from day one**, behind an `LLMProvider` interface | SDK `google.golang.org/genai`. Card output is enforced through `ResponseSchema` (structured output) *and* re-validated locally. Pin the exact model id in each card row. A free/local provider can be added later without touching the pipeline. |
-| Embeddings | `Embedder` interface; **bge-m3 (1024-dim) served by Ollama** | Runs as a container in `docker-compose`, bound to `127.0.0.1`, reached over HTTP. Nothing leaves the machine, so it's safe for `private` repos. Registered as the single active row in `embedding_model`. Hugging Face TEI is a drop-in alternative behind the same interface. Never mix models in one index. |
-| Secret scanning | **gitleaks as a Go library** (`github.com/zricethezav/gitleaks/v8/detect`), version pinned | Runs in-process, because redact-on-egress (§15.2.4) runs on every tool call and launching a CLI each time is too slow. The library API isn't stable, so pin it and cover it with the planted-secret tests. Add an entropy pass for literals. |
-| MCP transport | **stdio** | No network listener at all. HTTP transport only if a remote agent ever needs it, and then with auth and a localhost bind. |
-| Exact search (Phase 4) | Benchmark three options, pick one | (a) ParadeDB `pg_search`, BM25 inside Postgres, removes the sync problem; note it is **AGPL** (fine for personal use) and needs the ParadeDB Postgres image, which is a one-line compose change; (b) a small Rust Tantivy sidecar; (c) Bleve, pure Go. Verify the current state of each before choosing. |
-| Languages first | Dart, Kotlin, Swift, plus Rust/Go/Python/TS | Confirm with the histogram in §14.6. Grammars are pluggable, so the order only affects what ships first. Symbols are extracted through each grammar's `tags.scm` queries, so one generic extractor covers definitions; imports need small per-language queries. |
+| Core language | **Rust (100% of the core)** | Single `necro` binary built from a Cargo workspace (`edition = "2024"`). Native `tree-sitter`, native in-process `tantivy`, `sqlx` + `pgvector`, `rmcp` (official Rust MCP SDK), `cap-std` for capability-based path sandboxing, and native `goblin`/`object`/`capstone` for Phase 6 RE. Drops Python and Go completely—zero FFI glue, zero sidecars, zero ports later. Tree-sitter C grammars compile seamlessly via Cargo `cc` build scripts (and cross-compile cleanly via `cargo-zigbuild`). |
+| Migrations & DB | **`sqlx` + `sqlx-cli`**, plain reversible SQL | One authoritative `migrations/0001_init.up.sql` + `0001_init.down.sql` (§15.4), embedded into the binary via `sqlx::migrate!("./migrations")`. |
+| Card LLM | **Gemini, paid tier (or Vertex AI) from day one**, behind an `LlmProvider` trait | Typed `reqwest` client calling Gemini `generateContent` with `response_schema` generated from Rust types via `schemars`, *and* re-validated locally with `jsonschema`. Pin the exact model id in each card row. A free/local provider can be added later without touching the pipeline. |
+| Embeddings | `Embedder` trait; **`bge-m3` (1024-dim) served by Ollama** (or in-process `fastembed`) | Default: Ollama container in `docker-compose`, bound to `127.0.0.1`, reached over HTTP. Nothing leaves the machine, so it's safe for `private` repos. Registered as the single active row in `embedding_model`. In-process ONNX via `fastembed` or Hugging Face TEI are drop-in alternatives behind the same trait. Never mix models in one index. |
+| Secret scanning | **In-process Rust rule engine (`necro-redact`)** compiling `gitleaks.toml` rules (`regex::RegexSet` + `aho-corasick` prefilter) + Shannon entropy | Runs in-process at native Rust speed with zero regex backtracking, because redact-on-egress (§15.2.4) runs on every tool call and spawning a CLI process each time is too slow. Embed the upstream `gitleaks.toml` rule set at compile time and cover it with planted-secret tests. |
+| MCP transport | **stdio** (`rmcp` over `tokio::io::stdin` / `stdout`) | No network listener at all. HTTP/SSE transport only if a remote agent ever needs it, and then with auth and a `127.0.0.1` bind. |
+| Exact search (Phase 4) | **Tantivy (native in-process Rust crate)** | Since the core is Rust, `tantivy` embeds directly into `necro-index` with custom camelCase/snake_case and path tokenizers—no Rust sidecar needed. ParadeDB `pg_search` (AGPL) remains an optional benchmark comparison in Phase 4. |
+| Languages first | Dart, Kotlin, Swift, plus Rust/Go/Python/TS | Confirm with the histogram in §14.6. Grammars are pluggable crates (`tree-sitter-rust`, `tree-sitter-kotlin`, `tree-sitter-swift`, `tree-sitter-dart`, etc.), so the order only affects what ships first. Symbols are extracted through each grammar's `tags.scm` queries, so one generic extractor covers definitions; imports need small per-language queries. |
 
 **Gemini privacy:** the free tier may use inputs to improve the provider's products, so it is **not used**, not even in development. Use the paid API or Vertex AI and re-check the terms whenever the tier changes. Every LLM call is still treated as an egress point: redaction runs first, and `no_llm` projects never reach the provider.
 
 ### 15.2 `get_pointer` hardening (and all code-returning tools)
 
 1. **No caller-supplied paths.** Accept only `(project_id, file_id | relpath, start_line, end_line)` where the file exists in the `file` table. Anything not indexed is rejected.
-2. **Sandbox to the project root.** Open through Go's `os.OpenRoot` on the registered project root, or `git show <commit>:<path>` for committed content. Reject `..`, absolute paths, and symlinks that leave the root. Resolve and re-check before reading.
-3. **Denylist** regardless of index state: `.env*`, `*.pem`, `*.key`, `id_rsa*`, `.ssh/`, `.aws/`, `.git/`, keystores, `*.p12`, `google-services.json`, `.npmrc`, `.netrc`, and similar. Maintain it in config.
-4. **Redact on egress.** Run the secret scanner over every returned snippet at read time, not only at index time. Replace matches with `[REDACTED:type]`. The same applies to `get_module`, `find_string`, and any tool that returns source text.
+2. **Sandbox to the project root.** Open working-tree files only through a `cap_std::fs::Dir` capability handle opened on the registered project root (which enforces `openat2(RESOLVE_BENEATH)` on Linux and blocks `..`, absolute paths, and symlink escapes at the OS/handle boundary), or read committed blobs via `necro-git` (item 7).
+3. **Denylist** regardless of index state (`globset::GlobSet`): `.env*`, `*.pem`, `*.key`, `id_rsa*`, `.ssh/`, `.aws/`, `.git/`, keystores, `*.p12`, `google-services.json`, `.npmrc`, `.netrc`, and similar. Maintain it in config.
+4. **Redact on egress.** Run `necro-redact` over every returned snippet at read time, not only at index time. Replace matches with `[REDACTED:type]`. The same applies to `get_module`, `find_string`, and any tool that returns source text.
 5. **Caps:** max 200 lines per call, max N calls per session, and an audit log of every call (who, what, when).
 6. **Tests (required before Phase 3 exits):** `../../.ssh/id_rsa`, absolute paths, symlink escape, a file containing a planted fake AWS key, a request for an unindexed file, and the git argument-injection cases in item 7 must all fail or return redacted output.
 7. **No argument injection into git.** A caller-supplied commit is a classic injection point: `git show --output=/home/you/.bashrc` turns a read into a file write, and values like `--exec`, `-c core.pager=…` or a ref named `--help` behave in similar ways.
    - Accept a commit only if it matches `^[0-9a-f]{40}$|^[0-9a-f]{64}$` (SHA-1 / SHA-256). Never accept branch names, `HEAD~n` or other revision syntax from agents. Resolve those server-side if they're needed at all.
-   - Confirm that the object exists and is a commit (`git cat-file -t <sha>` must equal `commit`) before using it.
-   - Prefer `git cat-file blob <sha>:<path>`, which has no `--output` style options, over `git show`. Build the arguments with `exec.CommandContext`, never through a shell. Pin `-c core.pager=cat -c core.fsmonitor= -c protocol.allow=never`, and set the `GIT_CONFIG_NOSYSTEM=1` and `GIT_TERMINAL_PROMPT=0` environment variables.
-   - The path part comes from the `file` table (item 1), never from the request. A timeout and an output size cap apply to every git invocation.
+   - **Primary path (pure Rust, zero subprocesses):** read the commit and tree/blob directly from the repository's object database using `gix` (gitoxide), verifying the object kind is `Commit` and resolving the `file` table's relative path inside that commit's tree. Because no `git` binary is spawned, CLI flag injection is impossible by construction.
+   - **Fallback path (if shelling out to `git`):** confirm `git cat-file -t <sha>` equals `commit`, then run `git cat-file blob <sha>:<path>` via `tokio::process::Command` with `.arg()` (never a shell), pinning `-c core.pager=cat -c core.fsmonitor= -c protocol.allow=never` and setting `GIT_CONFIG_NOSYSTEM=1` and `GIT_TERMINAL_PROMPT=0`, with a hard timeout and output byte limit.
+   - The path part comes from the `file` table (item 1), never from the request.
 
 ### 15.3 Prompt-injection defenses for cards
 
@@ -522,9 +520,9 @@ Repo content, READMEs, comments and decompiled third-party strings are untrusted
 
 1. **Exclude by default:** vendored/third-party directories, `node_modules`, `Pods`, decompiled SDK code, and generated files never enter the summarizer bundle. Include them only by explicit opt-in.
 2. **Prompt structure:** untrusted content sits inside clearly delimited data blocks; the system prompt states that it is data and that any instructions inside it must be ignored and reported.
-3. **Constrained output:** strict JSON schema with enums where possible, hard length caps per field, no free-form "instructions" or "notes to the agent" fields.
+3. **Constrained output:** strict JSON schema (`schemars` + `jsonschema`) with enums where possible, hard length caps per field, no free-form "instructions" or "notes to the agent" fields.
 4. **Deterministic lint after generation:** reject or quarantine cards whose fields contain instruction-like patterns ("ignore previous", "you must", "system prompt", tool names, shell commands), URLs outside an allowlist, or base64-like blobs. Quarantined cards are not served until reviewed (`necro review`).
-   - **False positives:** developer gotchas often contain legitimate commands (`flutter pub get`, `xcrun simctl …`). Commands go into a typed `commands: [string]` card field (≤ 5 entries, ≤ 120 chars each). That field is checked against a denylist (pipes to a shell, `curl … | sh`, `rm -rf`, redirection into dotfiles, encoded payloads) and is always rendered as an inert code block, never as prose. Shell-command patterns are only flagged in the prose fields. Measure the quarantine rate on the real corpus during Phase 2 and tune from that (§15.5).
+   - **False positives:** developer gotchas often contain legitimate commands (`flutter pub get`, `xcrun simctl …`). Commands go into a typed `commands: Vec<String>` card field (≤ 5 entries, ≤ 120 chars each). That field is checked against a denylist (pipes to a shell, `curl … | sh`, `rm -rf`, redirection into dotfiles, encoded payloads) and is always rendered as an inert code block, never as prose. Shell-command patterns are only flagged in the prose fields. Measure the quarantine rate on the real corpus during Phase 2 and tune from that (§15.5).
 5. **Provenance envelope:** every MCP response wraps card content as `untrusted_derived_data: true`, with the source fingerprint and a note that nothing inside is an instruction. Agents should be told this in the server's tool descriptions.
 6. **Free-text fields are the weak point** (`why_stopped`, `gotchas`, idea summaries). Keep them short and plain; consider structured tags instead of prose where possible.
 7. **Synthetic (reverse-engineered) repos** get the strictest mode: bundles built from strings only after filtering, and cards always start in quarantine.
@@ -536,16 +534,16 @@ This reduces risk but cannot reach zero, so the provenance envelope and the quar
 
 Commit hash is not a valid cache key for dirty working trees, non-git folders, or synthetic repos.
 
-- **Fingerprint** = SHA-256 over the sorted list of `(relpath, content_hash)` for every non-ignored file (tracked and untracked), plus the scanner config version.
-- **Stat cache (required for the <2 s no-op rescan):** keep `(mtime_ns, size, inode)` per file next to its `content_hash`, the same way git's index does. Re-hash a file only when its stat tuple changes, then recompute the fingerprint from the cached hashes. Go further for clean git repos: when `HEAD` and the `git status --porcelain` output are both unchanged since the last scan, skip the filesystem walk.
+- **Fingerprint** = SHA-256 (or BLAKE3) over the sorted list of `(relpath, content_hash)` for every non-ignored file (tracked and untracked), plus the scanner config version.
+- **Stat cache (required for the <2 s no-op rescan):** keep `(mtime_ns, size, inode)` per file next to its `content_hash`, the same way git's index does. Re-hash a file only when its stat tuple changes, then recompute the fingerprint from the cached hashes. Go further for clean git repos: when `HEAD` and the `git status --porcelain` (or `gix` status) output are both unchanged since the last scan, skip the filesystem walk.
 - **Synthetic repos:** artifact SHA-256 + adapter name/version + toolchain versions + recovery config.
 - **Cache key** = `(fingerprint, prompt_version, model_id, schema_version)`.
 - The git commit is display metadata only.
 
-**Authoritative initial schema (`migrations/00001_init.sql`).** This replaces §5.2 and the earlier `ALTER TABLE` sketch. The project is new, so there is one init migration rather than a base migration plus patches.
+**Authoritative initial schema (`migrations/0001_init.up.sql` and `0001_init.down.sql`).** This replaces §5.2 and the earlier `ALTER TABLE` sketch. The project is new, so there is one init migration pair managed by `sqlx-cli` rather than a base migration plus patches.
 
 ```sql
--- +goose Up
+-- migrations/0001_init.up.sql
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
@@ -706,8 +704,10 @@ CREATE TABLE audit_log (
 -- The application DB role gets INSERT/SELECT only on audit_log, with no UPDATE/DELETE.
 
 CREATE TABLE meta (key TEXT PRIMARY KEY, value JSONB NOT NULL);  -- tokenizer, schema versions
+```
 
--- +goose Down
+```sql
+-- migrations/0001_init.down.sql
 DROP TABLE IF EXISTS meta, audit_log, scan_run, card, chunk, idea, embedding_model,
   edge, symbol, file, project, root CASCADE;
 ```
@@ -719,32 +719,33 @@ Notes:
 
 ### 15.5 Additional exit criteria
 
-- **Phase 0:** `goose up` / `goose down` / `goose up` round-trips cleanly in CI against an ephemeral Postgres.
+- **Phase 0:** `sqlx migrate run` / `sqlx migrate revert` / `sqlx migrate run` round-trips cleanly in CI against an ephemeral Postgres.
 - **Phase 1:** dirty-tree and non-git-folder scans produce stable fingerprints; the secret scanner passes a planted-secret test; a no-op rescan of a 5k-file repo finishes in < 2 s and makes zero content reads (verified through the stat cache counters).
 - **Phase 2:** the injection corpus (§15.3.8) is clean; every card carries model id, prompt version and fingerprint; the lint false-positive rate on your real corpus is measured and recorded (§15.3.4).
 - **Phase 3:** all §15.2.6 tests pass, including the git argument-injection cases, before the MCP server is connected to any agent.
 
 ---
 
-## 16. Revision 3: Review Findings Applied (authoritative)
+## 16. Revision 3 & 4: Review Findings Applied + Pure Rust Core (authoritative)
 
-An external review of Revision 2 checked the plan against the code that will be written from it. Each finding was confirmed valid and is fixed in place above. Where §16 and §15 differ, §16 wins.
+An external review of Revision 2 checked the plan against the code that will be written from it. Each finding (`R1`–`R12`) was confirmed valid and fixed in place above. **Revision 4 (`R13`) locks the core programming language to 100% Rust** across the entire workspace—no Python and no Go. Where §16 and earlier sections differ, §16 wins.
 
 | # | Finding | Status | Fixed in |
 |---|---|---|---|
-| R1 | Pre-§15 sections still described the Rust/Python split, commit-hash caching and a localhost listener; §11 would have been copied straight into the scaffold | Fixed | §10, §11, §12, §5.2 banner |
-| R2 | `git show <commit>:<path>` with a caller-supplied commit allowed **argument injection** (e.g. `--output=<file>` turns a read into a file write) | Fixed | §15.2.7 |
+| R1 | Pre-§15 sections still described the old split, commit-hash caching and a localhost listener; §11 would have been copied straight into the scaffold | Fixed | §6, §10, §11, §12, §5.2 banner |
+| R2 | `git show <commit>:<path>` with a caller-supplied commit allowed **argument injection** (e.g. `--output=<file>` turns a read into a file write) | Fixed: pure-Rust `gix` object lookup + locked `git cat-file blob` fallback | §15.2.7 |
 | R3 | The fingerprint re-hashed every file, so the <2 s no-op rescan target was unreachable | Fixed: stat cache + git short-circuit | §15.4, §15.5 |
-| R4 | The schema was a base migration plus `ALTER`s; the review's fixes (NOT NULL FKs, FK on `edge.dst_file`, edge indexes, CHECKs, FK on `scan_run`, prefix index on `symbol.name`) were missing; `root_id` pointed at no table; embeddings had no `model_id` column; `card_cache` had no constraints | Fixed: one authoritative `00001_init.sql` | §15.4 |
+| R4 | The schema was a base migration plus `ALTER`s; the review's fixes (NOT NULL FKs, FK on `edge.dst_file`, edge indexes, CHECKs, FK on `scan_run`, prefix index on `symbol.name`) were missing; `root_id` pointed at no table; embeddings had no `model_id` column; `card_cache` had no constraints | Fixed: one authoritative `0001_init.{up,down}.sql` | §15.4 |
 | R5 | `quarantined` was a project flag, but quarantine is a per-card state | Fixed: `card.status` | §15.4 |
-| R6 | Nothing said how bge-m3 actually runs from Go | Fixed: Ollama container behind `Embedder` | §15.1 |
-| R7 | The Gemini tier was left "check later" even though the free tier may use inputs for training | Fixed: paid tier / Vertex from day one; `ResponseSchema`-enforced output | §15.1 |
-| R8 | Redact-on-egress runs on every tool call, so shelling out to the gitleaks CLI is too slow | Fixed: gitleaks imported as a Go library, version pinned | §15.1 |
-| R9 | "Easy cross-compile" doesn't hold once tree-sitter brings in cgo | Fixed: native builds or `zig cc` | §15.1 |
-| R10 | The instruction lint will flag legitimate shell commands that developers write in gotchas | Mitigated: typed `commands[]` field + measured FP rate | §15.3.4, §15.5 |
-| R11 | ParadeDB `pg_search` is AGPL and needs its own Postgres image | Noted; deferred to the Phase 4 benchmark | §15.1 |
+| R6 | Nothing said how `bge-m3` actually runs | Fixed: Ollama container (or `fastembed`) behind `Embedder` trait | §15.1 |
+| R7 | The Gemini tier was left "check later" even though the free tier may use inputs for training | Fixed: paid tier / Vertex from day one; `response_schema`-enforced output | §15.1 |
+| R8 | Redact-on-egress runs on every tool call, so shelling out to the gitleaks CLI is too slow | Fixed: in-process `necro-redact` crate (`regex::RegexSet` + `aho-corasick` over `gitleaks.toml` + entropy) | §10, §15.1 |
+| R9 | Tree-sitter C grammars and cross-compilation | Fixed: native Cargo `cc` build scripts; `cargo-zigbuild` when cross-compiling | §12, §15.1 |
+| R10 | The instruction lint will flag legitimate shell commands that developers write in gotchas | Mitigated: typed `commands: Vec<String>` field + measured FP rate | §15.3.4, §15.5 |
+| R11 | Phase 4 exact search | Fixed: `tantivy` is now embedded directly in-process in `necro-index` (no sidecar needed in Rust) | §6, §11, §15.1 |
 | R12 | Agents get no value until week 3 | Optional thin slice documented; timeline unchanged | §16.1 |
+| R13 | **Language decision locked to pure Rust** (no Python, no Go) | Applied across §6, §8, §10, §11, §12, §14, §15, §16 | All sections |
 
 ### 16.1 Optional week-1 thin slice
 
-If agent value is wanted before week 3, reorder (without changing the architecture): discovery + manifests + git facts + gitleaks → Gemini L0 card → MCP `list_projects` + `get_card` over stdio, all in week 1; tree-sitter symbols in week 2; ideas, embeddings and `search_ideas` in weeks 2–3. Every §15.2 / §15.3 control still applies to the slice.
+If agent value is wanted before week 3, reorder (without changing the architecture): `necro-discover` + manifests + git facts + `necro-redact` → Gemini L0 card (`necro-summarize`) → MCP `list_projects` + `get_card` over stdio (`necro-mcp`), all in week 1; tree-sitter symbols (`necro-parse`) in week 2; ideas, embeddings and `search_ideas` in weeks 2–3. Every §15.2 / §15.3 control still applies to the slice.
