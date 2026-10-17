@@ -1,0 +1,18 @@
+[package]
+name = "necro-scan"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+blake3 = "1.8.7"
+ignore = "0.4.33"
+necro-core = { version = "0.1.0", path = "../necro-core" }
+necro-discover = { version = "0.1.0", path = "../necro-discover" }
+necro-git = { version = "0.1.0", path = "../necro-git" }
+necro-parse = { version = "0.1.0", path = "../necro-parse" }
+necro-redact = { version = "0.1.0", path = "../necro-redact" }
+necro-sandbox = { version = "0.1.0", path = "../necro-sandbox" }
+necro-store = { version = "0.1.0", path = "../necro-store" }
+rayon = "1.12.0"
+tracing = "0.1.44"

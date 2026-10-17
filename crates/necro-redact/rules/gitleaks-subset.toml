@@ -1,0 +1,134 @@
+# Secret-detection rules in gitleaks.toml format (https://github.com/gitleaks/gitleaks).
+#
+# This is a curated subset of the upstream default rule set, kept RE2/Rust-`regex` compatible.
+# The loader in `necro-redact` understands the same fields as gitleaks (`id`, `regex`,
+# `keywords`, `entropy`, `secretGroup`), so the full upstream `config/gitleaks.toml` can be
+# dropped in later via `necro.toml` without code changes.
+
+title = "necropolis-default"
+
+[[rules]]
+id = "private-key"
+description = "PEM private key block"
+regex = '''-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----'''
+keywords = ["-----begin"]
+
+[[rules]]
+id = "aws-access-token"
+description = "AWS access key id"
+regex = '''\b((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16})\b'''
+keywords = ["akia", "asia", "abia", "acca", "a3t"]
+secretGroup = 1
+
+[[rules]]
+id = "aws-secret-key"
+description = "AWS secret access key next to an aws/secret label"
+regex = '''(?i)aws.{0,20}?(?:secret|key).{0,20}?['"]([A-Za-z0-9/+=]{40})['"]'''
+keywords = ["aws"]
+secretGroup = 1
+
+[[rules]]
+id = "github-pat"
+description = "GitHub personal access / OAuth / app tokens"
+regex = '''\b((?:ghp|gho|ghu|ghs|ghr)_[0-9a-zA-Z]{36})\b'''
+keywords = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+secretGroup = 1
+
+[[rules]]
+id = "github-fine-grained-pat"
+description = "GitHub fine-grained PAT"
+regex = '''\b(github_pat_[0-9A-Za-z_]{82})\b'''
+keywords = ["github_pat_"]
+secretGroup = 1
+
+[[rules]]
+id = "gitlab-pat"
+description = "GitLab personal access token"
+regex = '''\b(glpat-[0-9A-Za-z_-]{20})\b'''
+keywords = ["glpat-"]
+secretGroup = 1
+
+[[rules]]
+id = "slack-token"
+description = "Slack bot/user/app token"
+regex = '''\b(xox[baprs]-[0-9a-zA-Z-]{10,48})\b'''
+keywords = ["xoxb", "xoxa", "xoxp", "xoxr", "xoxs"]
+secretGroup = 1
+
+[[rules]]
+id = "slack-webhook"
+description = "Slack incoming webhook"
+regex = '''(hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,56})'''
+keywords = ["hooks.slack.com"]
+secretGroup = 1
+
+[[rules]]
+id = "gcp-api-key"
+description = "Google / Firebase API key"
+regex = '''\b(AIza[0-9A-Za-z_-]{35})\b'''
+keywords = ["aiza"]
+secretGroup = 1
+
+[[rules]]
+id = "stripe-key"
+description = "Stripe secret / restricted key"
+regex = '''\b((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})\b'''
+keywords = ["sk_test", "sk_live", "sk_prod", "rk_test", "rk_live", "rk_prod"]
+secretGroup = 1
+
+[[rules]]
+id = "openai-api-key"
+description = "OpenAI API key"
+regex = '''\b(sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}T3BlbkFJ[A-Za-z0-9_-]{20,})\b'''
+keywords = ["t3blbkfj"]
+secretGroup = 1
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key"
+regex = '''\b(sk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_-]{80,})'''
+keywords = ["sk-ant-"]
+secretGroup = 1
+
+[[rules]]
+id = "npm-token"
+description = "npm access token"
+regex = '''(?i)\b(npm_[a-z0-9]{36})\b'''
+keywords = ["npm_"]
+secretGroup = 1
+
+[[rules]]
+id = "sendgrid-api-key"
+description = "SendGrid API key"
+regex = '''\b(SG\.[0-9A-Za-z_-]{22}\.[0-9A-Za-z_-]{43})\b'''
+keywords = ["sg."]
+secretGroup = 1
+
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram bot token"
+regex = '''\b(\d{8,10}:AA[0-9A-Za-z_-]{33})\b'''
+keywords = [":aa"]
+secretGroup = 1
+
+[[rules]]
+id = "jwt"
+description = "JSON Web Token"
+regex = '''\b(eyJ[A-Za-z0-9_-]{15,}\.eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{10,})'''
+keywords = ["eyj"]
+secretGroup = 1
+
+[[rules]]
+id = "connection-string-password"
+description = "Password embedded in a database / broker URL"
+regex = '''(?i)\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqps?)://[^:\s/@]+:([^@\s/]{3,})@'''
+keywords = ["://"]
+secretGroup = 1
+
+[[rules]]
+id = "generic-api-key"
+description = "Generic secret assignment (key/token/secret/password = high-entropy value)"
+regex = '''(?i)(?:key|api|token|secret|client|passwd|password|pwd|auth|access)(?:[0-9a-z_.-]{0,20})[\t '"]{0,3}(?:=|>|:{1,3}=|\|\|:|<=|=>|:|\?=)[\t '"`=]{0,5}([0-9a-z_.=+/-]{10,150})(?:['"\n\r\t `;,)]|$)'''
+keywords = ["key", "api", "token", "secret", "client", "passwd", "password", "pwd", "auth", "access"]
+entropy = 3.5
+secretGroup = 1

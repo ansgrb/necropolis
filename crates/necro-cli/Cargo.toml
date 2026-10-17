@@ -1,0 +1,23 @@
+[package]
+name = "necro-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+necro-core = { version = "0.1.0", path = "../necro-core" }
+necro-discover = { version = "0.1.0", path = "../necro-discover" }
+necro-git = { version = "0.1.0", path = "../necro-git" }
+necro-llm = { version = "0.1.0", path = "../necro-llm" }
+necro-mcp = { version = "0.1.0", path = "../necro-mcp" }
+necro-parse = { version = "0.1.0", path = "../necro-parse" }
+necro-redact = { version = "0.1.0", path = "../necro-redact" }
+necro-sandbox = { version = "0.1.0", path = "../necro-sandbox" }
+necro-scan = { version = "0.1.0", path = "../necro-scan" }
+necro-store = { version = "0.1.0", path = "../necro-store" }
+necro-summarize = { version = "0.1.0", path = "../necro-summarize" }
+serde_json = "1.0.154"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

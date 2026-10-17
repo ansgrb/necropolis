@@ -1,0 +1,21 @@
+{
+  "name": "repair-shop-kafka",
+  "one_liner": "Event-driven repair work-order pipeline using Kafka topics and idempotent consumers.",
+  "status": "abandoned",
+  "languages": ["go", "python"],
+  "stack": ["go", "kafka", "postgres", "docker"],
+  "entry_points": ["cmd/worker/main.go", "internal/consumer/handler.go"],
+  "ideas": [
+    {
+      "name": "Outbox table relay with deduplication key per work-order state transition",
+      "where": "internal/consumer/handler.go:25-138"
+    }
+  ],
+  "reusable_modules": ["internal/consumer", "internal/outbox"],
+  "gotchas": ["Requires local Kafka broker on 9092 before integration tests pass"],
+  "commands": ["docker compose up -d", "go test ./..."],
+  "last_commit_date": "2024-08-19",
+  "source_fingerprint": "c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f901234",
+  "git_commit": "7a09f11",
+  "generated_by": "deterministic"
+}

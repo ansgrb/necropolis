@@ -1,0 +1,11 @@
+[package]
+name = "necro-redact"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aho-corasick = "1.1.5"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+toml = "1.1.8"

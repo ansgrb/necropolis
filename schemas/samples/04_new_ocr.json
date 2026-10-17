@@ -1,0 +1,21 @@
+{
+  "name": "new_ocr",
+  "one_liner": "Document OCR preprocessing and layout bounding-box extractor in Python.",
+  "status": "archived",
+  "languages": ["python"],
+  "stack": ["python", "fastapi", "pydantic", "pytest"],
+  "entry_points": ["app/main.py", "app/pipeline/deskew.py"],
+  "ideas": [
+    {
+      "name": "Adaptive Hough-transform deskewing and shadow removal before OCR pass",
+      "where": "app/pipeline/deskew.py:10-112"
+    }
+  ],
+  "reusable_modules": ["app/pipeline"],
+  "gotchas": ["Poppler system binary is required for PDF page rasterization"],
+  "commands": ["pytest -q"],
+  "last_commit_date": "2024-02-14",
+  "source_fingerprint": "d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90123456",
+  "git_commit": "12ab34c",
+  "generated_by": "deterministic"
+}

@@ -1,0 +1,12 @@
+[package]
+name = "necro-discover"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.97"
+ignore = "0.4.33"
+necro-core = { version = "0.1.0", path = "../necro-core" }
+
+[dev-dependencies]
+tempfile = "3.19.1"

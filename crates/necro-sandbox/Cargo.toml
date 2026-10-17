@@ -1,0 +1,9 @@
+[package]
+name = "necro-sandbox"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cap-std = "4.0.3"
+globset = "0.4.20"
+thiserror = "2.0.21"

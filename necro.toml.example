@@ -1,0 +1,19 @@
+# Necropolis Configuration Example (~/.config/necro/necro.toml or ./necro.toml)
+
+# PostgreSQL 16 + pgvector connection string (loopback-bound)
+database_url = "postgres://necro:necro-dev-only@127.0.0.1:55432/necropolis"
+
+# Maximum file size to read into memory for AST parsing / pointer slicing
+max_file_bytes = 524288
+
+# Maximum pointer slices per MCP session
+session_pointer_cap = 20
+
+# Maximum bytes returned per get_pointer request
+pointer_max_bytes = 8192
+
+# Extra path denylist globs enforced before indexing and on every get_pointer call
+extra_denylist = [
+    "**/*.secret",
+    "**/credentials/**",
+]

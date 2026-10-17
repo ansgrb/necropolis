@@ -1,0 +1,35 @@
+# Necropolis local services. Everything binds to 127.0.0.1 only (blueprint §10).
+#   make up            -> Postgres 16 + pgvector
+#   make up-embed      -> also start an Ollama container for bge-m3 (optional; Phase 3)
+name: necropolis
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: necro
+      POSTGRES_PASSWORD: ${NECRO_DB_PASSWORD:-necro-dev-only}
+      POSTGRES_DB: necropolis
+    ports:
+      - "127.0.0.1:${NECRO_DB_PORT:-55432}:5432"
+    volumes:
+      - necro_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U necro -d necropolis"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["embed"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${NECRO_OLLAMA_PORT:-11435}:11434"
+    volumes:
+      - necro_ollama:/root/.ollama
+
+volumes:
+  necro_pg:
+  necro_ollama:
